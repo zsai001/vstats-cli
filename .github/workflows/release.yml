@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          OUTPUT=vstats-cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            OUTPUT="${OUTPUT}.exe"
+          fi
+          go build -ldflags "-X main.Version=${VERSION} -s -w" -o ${OUTPUT} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vstats-cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: vstats-cli-*
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -name 'vstats-cli-*' -exec cp {} release/ \;
+          cd release
+          sha256sum vstats-cli-* > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-homebrew:
+    name: Update Homebrew
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Calculate checksums and update formula
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          
+          DARWIN_AMD64_SHA=$(sha256sum artifacts/vstats-cli-darwin-amd64/vstats-cli-darwin-amd64 | cut -d' ' -f1)
+          DARWIN_ARM64_SHA=$(sha256sum artifacts/vstats-cli-darwin-arm64/vstats-cli-darwin-arm64 | cut -d' ' -f1)
+          LINUX_AMD64_SHA=$(sha256sum artifacts/vstats-cli-linux-amd64/vstats-cli-linux-amd64 | cut -d' ' -f1)
+          LINUX_ARM64_SHA=$(sha256sum artifacts/vstats-cli-linux-arm64/vstats-cli-linux-arm64 | cut -d' ' -f1)
+          
+          sed -i "s/version \".*\"/version \"${VERSION}\"/" homebrew/Formula/vstats.rb
+          sed -i "s/REPLACE_WITH_ACTUAL_SHA256_FOR_DARWIN_AMD64/${DARWIN_AMD64_SHA}/" homebrew/Formula/vstats.rb
+          sed -i "s/REPLACE_WITH_ACTUAL_SHA256_FOR_DARWIN_ARM64/${DARWIN_ARM64_SHA}/" homebrew/Formula/vstats.rb
+          sed -i "s/REPLACE_WITH_ACTUAL_SHA256_FOR_LINUX_AMD64/${LINUX_AMD64_SHA}/" homebrew/Formula/vstats.rb
+          sed -i "s/REPLACE_WITH_ACTUAL_SHA256_FOR_LINUX_ARM64/${LINUX_ARM64_SHA}/" homebrew/Formula/vstats.rb
+          
+          cat homebrew/Formula/vstats.rb
+
+      # Note: You'll need to set up a separate repo for homebrew-vstats
+      # and configure HOMEBREW_TAP_TOKEN secret to push updates
+      # - name: Push to Homebrew tap
+      #   uses: dmnemec/copy_file_to_another_repo_action@main
+      #   env:
+      #     API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      #   with:
+      #     source_file: 'homebrew/Formula/vstats.rb'
+      #     destination_repo: 'zsai001/homebrew-vstats'
+      #     destination_folder: 'Formula'
+      #     user_email: 'github-actions[bot]@users.noreply.github.com'
+      #     user_name: 'github-actions[bot]'
+      #     commit_message: 'Update vstats to ${{ github.ref_name }}'
+
+  update-scoop:
+    name: Update Scoop
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Calculate checksums and update manifest
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          
+          WINDOWS_AMD64_SHA=$(sha256sum artifacts/vstats-cli-windows-amd64/vstats-cli-windows-amd64.exe | cut -d' ' -f1)
+          WINDOWS_ARM64_SHA=$(sha256sum artifacts/vstats-cli-windows-arm64/vstats-cli-windows-arm64.exe | cut -d' ' -f1)
+          
+          # Update version
+          sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" scoop/vstats.json
+          
+          # Update URLs
+          sed -i "s|/v[0-9.]*-*[a-z0-9]*/vstats-cli|/v${VERSION}/vstats-cli|g" scoop/vstats.json
+          
+          # Update hashes
+          sed -i "0,/REPLACE_WITH_ACTUAL_SHA256/{s/REPLACE_WITH_ACTUAL_SHA256/${WINDOWS_AMD64_SHA}/}" scoop/vstats.json
+          sed -i "s/REPLACE_WITH_ACTUAL_SHA256/${WINDOWS_ARM64_SHA}/" scoop/vstats.json
+          
+          cat scoop/vstats.json
+
+      # Note: You'll need to set up a separate repo for scoop-vstats
+      # and configure SCOOP_BUCKET_TOKEN secret to push updates
+      # - name: Push to Scoop bucket
+      #   uses: dmnemec/copy_file_to_another_repo_action@main
+      #   env:
+      #     API_TOKEN_GITHUB: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+      #   with:
+      #     source_file: 'scoop/vstats.json'
+      #     destination_repo: 'zsai001/scoop-vstats'
+      #     user_email: 'github-actions[bot]@users.noreply.github.com'
+      #     user_name: 'github-actions[bot]'
+      #     commit_message: 'Update vstats to ${{ github.ref_name }}'
+
